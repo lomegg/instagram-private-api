@@ -1,11 +1,22 @@
-import { IgApiClient } from '../client';
-import { random } from 'lodash';
+import { defaultsDeep, inRange, random } from 'lodash';
+import { Subject } from 'rxjs';
+import { AttemptOptions, retry } from '@lifeomic/attempt';
 import * as request from 'request-promise';
-import { Options } from 'request';
-import { ActionSpamError, AuthenticationError, CheckpointError, SentryBlockError } from '../exceptions';
-import { plainToClass } from 'class-transformer';
-import { CheckpointResponse } from '../responses';
+import { Options, Response } from 'request';
+import { IgApiClient } from './client';
+import {
+  IgActionSpamError,
+  IgCheckpointError,
+  IgLoginRequiredError,
+  IgNetworkError,
+  IgNotFoundError,
+  IgPrivateUserError,
+  IgResponseError,
+  IgSentryBlockError,
+} from '../errors';
 import hmac = require('crypto-js/hmac-sha256');
+import JSONbigInt = require('json-bigint');
+const JSONbigString = JSONbigInt({ storeAsString: true });
 
 type Payload = { [key: string]: any } | string;
 
@@ -15,34 +26,32 @@ interface SignedPost {
 }
 
 export class Request {
+  end$ = new Subject();
+  attemptOptions: Partial<AttemptOptions<any>> = {
+    maxAttempts: 1,
+  };
+
   constructor(private client: IgApiClient) {}
 
-  private static requestTransform(body, response, resolveWithFullResponse) {
-    // Sometimes we have numbers greater than Number.MAX_SAFE_INTEGER in json response
-    // To handle it we just wrap numbers with length > 15 it double quotes to get strings instead
-    response.body = JSON.parse(body.replace(/([\[:])?(-?[\d.]{15,})(\s*?[,}\]])/gi, `$1"$2"$3`));
+  private static requestTransform(body, response: Response, resolveWithFullResponse) {
+    if (response.headers['content-type'].startsWith('application/json')) {
+      try {
+        // Sometimes we have numbers greater than Number.MAX_SAFE_INTEGER in json response
+        // To handle it we just wrap numbers with length > 15 it double quotes to get strings instead
+        response.body = JSONbigString.parse(body);
+      } catch (e) {
+        if (inRange(response.statusCode, 200, 299)) {
+          throw e;
+        }
+      }
+    }
     return resolveWithFullResponse ? response : response.body;
   }
 
-  private static errorMiddleware(response) {
-    const json = response.body;
-    if (json.spam) {
-      throw new ActionSpamError(json);
-    }
-    if (json.message === 'challenge_required') {
-      const checkpointResponse = plainToClass(CheckpointResponse, json as CheckpointResponse);
-      throw new CheckpointError(checkpointResponse);
-    }
-    if (json.message === 'login_required') {
-      throw new AuthenticationError('Login required to process this request');
-    }
-    if (json.error_type === 'sentry_block') {
-      throw new SentryBlockError(json);
-    }
-  }
-
-  public async send(userOptions: Options): Promise<any> {
-    const baseOptions = {
+  public async send<T = any>(
+    userOptions: Options,
+  ): Promise<Pick<Response, Exclude<keyof Response, 'body'>> & { body: T }> {
+    const options = defaultsDeep(userOptions, {
       baseUrl: 'https://i.instagram.com/',
       resolveWithFullResponse: true,
       proxy: this.client.state.proxyUrl,
@@ -51,15 +60,14 @@ export class Request {
       jar: this.client.state.cookieJar,
       strictSSL: false,
       gzip: true,
-    };
-    const requestOptions = Object.assign(baseOptions, userOptions, {
-      headers: this.getDefaultHeaders(userOptions.headers),
+      headers: this.getDefaultHeaders(),
     });
-    const response = await request(requestOptions);
+    let response = await this.faultTolerantRequest(options);
+    process.nextTick(() => this.end$.next());
     if (response.body.status === 'ok') {
       return response;
     }
-    return Request.errorMiddleware(response);
+    throw this.handleResponseError(response);
   }
 
   public sign(payload: Payload): string {
@@ -69,7 +77,7 @@ export class Request {
   }
 
   public signPost(payload: Payload): SignedPost {
-    if (typeof payload === 'object') {
+    if (typeof payload === 'object' && !payload._csrftoken) {
       payload._csrftoken = this.client.state.CSRFToken;
     }
     const signed_body = this.sign(payload);
@@ -79,7 +87,41 @@ export class Request {
     };
   }
 
-  private getDefaultHeaders(userHeaders = {}) {
+  private handleResponseError(response: Response) {
+    const json = response.body;
+    if (json.spam) {
+      return new IgActionSpamError(response);
+    }
+    if (response.statusCode === 404) {
+      return new IgNotFoundError(response);
+    }
+    if (typeof json.message === 'string') {
+      if (json.message === 'challenge_required') {
+        this.client.state.checkpoint = json;
+        return new IgCheckpointError(response);
+      }
+      if (json.message === 'login_required') {
+        return new IgLoginRequiredError(response);
+      }
+      if (json.message.toLowerCase() === 'not authorized to view user') {
+        return new IgPrivateUserError(response);
+      }
+    }
+    if (json.error_type === 'sentry_block') {
+      return new IgSentryBlockError(response);
+    }
+    return new IgResponseError(response);
+  }
+
+  private async faultTolerantRequest(options: Options) {
+    try {
+      return await retry(async () => request(options), this.attemptOptions);
+    } catch (err) {
+      throw new IgNetworkError(err);
+    }
+  }
+
+  private getDefaultHeaders() {
     return {
       'X-FB-HTTP-Engine': 'Liger',
       'X-IG-Connection-Type': 'WIFI',
@@ -95,7 +137,6 @@ export class Request {
       'User-Agent': this.client.state.appUserAgent,
       'X-IG-App-ID': this.client.state.fbAnalyticsApplicationId,
       'Accept-Language': this.client.state.language.replace('_', '-'),
-      ...userHeaders,
     };
   }
 }
